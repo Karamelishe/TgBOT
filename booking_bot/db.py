@@ -5,10 +5,7 @@ import aiosqlite
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta, timezone
- main
-=======
 from contextlib import asynccontextmanager
- cursor/telegram-booking-and-reminder-bot-4375
 
 
 @dataclass
@@ -39,6 +36,9 @@ class Booking:
     created_at: str
     reminder_sent: int
     status: str
+    guests_count: int
+    reminder_hours_before: Optional[int]
+    reminder_enabled: int
 
 
 class Database:
@@ -46,24 +46,17 @@ class Database:
         self.db_path = db_path
         self._lock = asyncio.Lock()
 
- main
-
     @asynccontextmanager
- cursor/telegram-booking-and-reminder-bot-4375
     async def connect(self) -> aiosqlite.Connection:
         conn = await aiosqlite.connect(self.db_path)
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
         conn.row_factory = aiosqlite.Row
- main
-        return conn
-
         try:
             yield conn
         finally:
             await conn.close()
- cursor/telegram-booking-and-reminder-bot-4375
 
     async def init(self) -> None:
         async with self.connect() as conn:
@@ -94,7 +87,10 @@ class Database:
                     slot_id INTEGER NOT NULL UNIQUE REFERENCES slots(id) ON DELETE CASCADE,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     reminder_sent INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'booked'
+                    status TEXT NOT NULL DEFAULT 'booked',
+                    guests_count INTEGER NOT NULL DEFAULT 1,
+                    reminder_hours_before INTEGER DEFAULT 2,
+                    reminder_enabled INTEGER NOT NULL DEFAULT 1
                 );
                 """
             )
@@ -147,6 +143,12 @@ class Database:
             await conn.commit()
             return cur.rowcount
 
+    async def update_slot_note(self, slot_id: int, note: str) -> bool:
+        async with self.connect() as conn:
+            cur = await conn.execute("UPDATE slots SET note = ? WHERE id = ?", (note, slot_id))
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def list_free_slots(self, since_utc_iso: Optional[str] = None, date_only: Optional[str] = None) -> List[Slot]:
         query = (
             "SELECT s.* FROM slots s "
@@ -185,11 +187,11 @@ class Database:
                 return [Slot(**dict(r)) for r in rows]
 
     # Bookings
-    async def create_booking(self, user_id: int, slot_id: int) -> int:
+    async def create_booking(self, user_id: int, slot_id: int, guests_count: int = 1, reminder_hours_before: Optional[int] = 2, reminder_enabled: int = 1) -> int:
         async with self.connect() as conn:
             await conn.execute(
-                "INSERT INTO bookings (user_id, slot_id) VALUES (?, ?)",
-                (user_id, slot_id),
+                "INSERT INTO bookings (user_id, slot_id, guests_count, reminder_hours_before, reminder_enabled) VALUES (?, ?, ?, ?, ?)",
+                (user_id, slot_id, guests_count, reminder_hours_before, reminder_enabled),
             )
             await conn.commit()
             async with conn.execute("SELECT id FROM bookings WHERE user_id = ? AND slot_id = ?", (user_id, slot_id)) as cur:
@@ -216,7 +218,7 @@ class Database:
 
     async def list_bookings(self, date_only: Optional[str] = None) -> List[Tuple[Booking, User, Slot]]:
         query = (
-            "SELECT b.id AS b_id, b.user_id AS b_user_id, b.slot_id AS b_slot_id, b.created_at AS b_created_at, b.reminder_sent AS b_reminder_sent, b.status AS b_status, "
+            "SELECT b.id AS b_id, b.user_id AS b_user_id, b.slot_id AS b_slot_id, b.created_at AS b_created_at, b.reminder_sent AS b_reminder_sent, b.status AS b_status, b.guests_count AS b_guests_count, b.reminder_hours_before AS b_reminder_hours_before, b.reminder_enabled AS b_reminder_enabled, "
             "u.id AS u_id, u.tg_user_id AS u_tg_user_id, u.chat_id AS u_chat_id, u.full_name AS u_full_name, u.phone AS u_phone, u.is_admin AS u_is_admin, u.created_at AS u_created_at, "
             "s.id AS s_id, s.slot_utc AS s_slot_utc, s.duration_minutes AS s_duration_minutes, s.note AS s_note, s.created_by AS s_created_by "
             "FROM bookings b JOIN users u ON u.id = b.user_id JOIN slots s ON s.id = b.slot_id"
@@ -240,6 +242,9 @@ class Database:
                         created_at=r["b_created_at"],
                         reminder_sent=r["b_reminder_sent"],
                         status=r["b_status"],
+                        guests_count=r["b_guests_count"],
+                        reminder_hours_before=r["b_reminder_hours_before"],
+                        reminder_enabled=r["b_reminder_enabled"],
                     )
                     user = User(
                         id=r["u_id"],
@@ -265,19 +270,24 @@ class Database:
             await conn.execute("UPDATE bookings SET reminder_sent = 1 WHERE id = ?", (booking_id,))
             await conn.commit()
 
-    async def find_bookings_for_reminder(self, now_utc: datetime) -> List[Tuple[int, int, int, str]]:
-        # Returns tuples: (booking_id, user_chat_id, slot_id, slot_utc_iso)
-        # window: send when slot_time - now in [2h, 2h + 60s)
-        lower = now_utc + timedelta(hours=2)
-        upper = lower + timedelta(seconds=60)
-        lower_iso = lower.astimezone(timezone.utc).isoformat()
-        upper_iso = upper.astimezone(timezone.utc).isoformat()
+    async def find_bookings_for_reminder(self, now_utc: datetime) -> List[Tuple[int, int, int, str, int]]:
+        # Returns tuples: (booking_id, user_chat_id, slot_id, slot_utc_iso, reminder_hours_before)
+        # window: send when slot_time - now in [reminder_hours_before, reminder_hours_before + 60s)
+        # We need to check each booking's reminder settings
         query = (
-            "SELECT b.id AS booking_id, u.chat_id AS chat_id, s.id AS slot_id, s.slot_utc AS slot_utc "
+            "SELECT b.id AS booking_id, u.chat_id AS chat_id, s.id AS slot_id, s.slot_utc AS slot_utc, b.reminder_hours_before AS reminder_hours_before "
             "FROM bookings b JOIN users u ON u.id = b.user_id JOIN slots s ON s.id = b.slot_id "
-            "WHERE b.reminder_sent = 0 AND s.slot_utc >= ? AND s.slot_utc < ? AND b.status = 'booked'"
+            "WHERE b.reminder_sent = 0 AND b.reminder_enabled = 1 AND b.status = 'booked'"
         )
         async with self.connect() as conn:
-            async with conn.execute(query, (lower_iso, upper_iso)) as cur:
+            async with conn.execute(query) as cur:
                 rows = await cur.fetchall()
-                return [(r["booking_id"], r["chat_id"], r["slot_id"], r["slot_utc"]) for r in rows]
+                result = []
+                for r in rows:
+                    reminder_hours = r["reminder_hours_before"] or 2  # default to 2 hours
+                    lower = now_utc + timedelta(hours=reminder_hours)
+                    upper = lower + timedelta(seconds=60)
+                    slot_time = datetime.fromisoformat(r["slot_utc"].replace('Z', '+00:00'))
+                    if lower <= slot_time < upper:
+                        result.append((r["booking_id"], r["chat_id"], r["slot_id"], r["slot_utc"], reminder_hours))
+                return result

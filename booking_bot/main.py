@@ -10,14 +10,11 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.markdown import hbold
- main
-=======
 from aiogram.client.default import DefaultBotProperties
- cursor/telegram-booking-and-reminder-bot-4375
 
 from config import load_settings
 from db import Database, Slot
-from keyboards import contact_request_kb, dates_kb, times_kb
+from keyboards import contact_request_kb, dates_kb, times_kb, guests_count_kb, reminder_settings_kb, confirm_booking_kb
 from utils import local_to_utc_iso, utc_iso_to_local_str, unique_sorted_dates_local
 
 
@@ -27,15 +24,14 @@ logger = logging.getLogger(__name__)
 
 settings = load_settings()
 
- main
-bot = Bot(token=settings.bot_token, parse_mode=ParseMode.HTML)
-=======
 bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
- cursor/telegram-booking-and-reminder-bot-4375
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 db = Database(settings.database_path)
+
+# Simple session storage for booking flow
+booking_sessions = {}
 
 
 async def ensure_user_record(message: Message) -> int:
@@ -60,15 +56,15 @@ async def list_dates_keyboard() -> Tuple[str, Optional[List[str]]]:
     return ("Выберите дату:", dates_local)
 
 
-async def list_times_keyboard(date_local: str) -> Tuple[str, Optional[List[Tuple[int, str]]]]:
+async def list_times_keyboard(date_local: str) -> Tuple[str, Optional[List[Tuple[int, str, Optional[str]]]]]:
     # Need to find free slots for that local date
     # To avoid DST issues, convert all free slots to local and filter by date string
     free = await db.list_free_slots(since_utc_iso=None)
-    pairs: List[Tuple[int, str]] = []
+    pairs: List[Tuple[int, str, Optional[str]]] = []
     for s in free:
         d_str, t_str = utc_iso_to_local_str(s.slot_utc, settings.timezone)
         if d_str == date_local:
-            pairs.append((s.id, t_str))
+            pairs.append((s.id, t_str, s.note))
     pairs.sort(key=lambda x: x[1])
     if not pairs:
         return (f"На дату {date_local} свободных слотов нет.", None)
@@ -146,16 +142,93 @@ async def on_cancel(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("book:"))
-async def on_book(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("select_time:"))
+async def on_select_time(callback: CallbackQuery):
     slot_id = int(callback.data.split(":", 1)[1])  # type: ignore[union-attr]
     tg_user = callback.from_user
     user = await db.get_user_by_tg(tg_user.id)
     if not user or not user.phone:
         await callback.answer("Сначала поделитесь номером телефона через /start", show_alert=True)
         return
+    
+    # Store slot_id in session
+    booking_sessions[tg_user.id] = {"slot_id": slot_id}
+    
+    # Show guests count selection
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        "Сколько человек будете?",
+        reply_markup=guests_count_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("guests:"))
+async def on_guests_count(callback: CallbackQuery):
+    guests_count = int(callback.data.split(":", 1)[1])  # type: ignore[union-attr]
+    tg_user = callback.from_user
+    
+    # Store guests count in session
+    if tg_user.id in booking_sessions:
+        booking_sessions[tg_user.id]["guests_count"] = guests_count
+    
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"Выбрано гостей: {guests_count}\n\n"
+        "Когда напомнить о визите?",
+        reply_markup=reminder_settings_kb()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("reminder:"))
+async def on_reminder_setting(callback: CallbackQuery):
+    reminder_hours = int(callback.data.split(":", 1)[1])  # type: ignore[union-attr]
+    tg_user = callback.from_user
+    
+    # Get data from session
+    session = booking_sessions.get(tg_user.id, {})
+    slot_id = session.get("slot_id")
+    guests_count = session.get("guests_count", 1)
+    
+    if not slot_id:
+        await callback.answer("Ошибка сессии. Начните заново.", show_alert=True)
+        return
+    
+    # Store reminder setting in session
+    booking_sessions[tg_user.id]["reminder_hours"] = reminder_hours if reminder_hours > 0 else None
+    
+    # Show confirmation with all details
+    reminder_text = "Без напоминания" if reminder_hours == 0 else f"За {reminder_hours} час(ов)"
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"Проверьте данные бронирования:\n\n"
+        f"Количество гостей: {guests_count}\n"
+        f"Напоминание: {reminder_text}\n\n"
+        f"Подтвердите бронирование:",
+        reply_markup=confirm_booking_kb(slot_id, guests_count, reminder_hours if reminder_hours > 0 else None)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_booking:"))
+async def on_confirm_booking(callback: CallbackQuery):
+    parts = callback.data.split(":")  # type: ignore[union-attr]
+    slot_id = int(parts[1])
+    guests_count = int(parts[2])
+    reminder_hours = int(parts[3]) if parts[3] != "0" else None
+    
+    tg_user = callback.from_user
+    user = await db.get_user_by_tg(tg_user.id)
+    if not user or not user.phone:
+        await callback.answer("Сначала поделитесь номером телефона через /start", show_alert=True)
+        return
+    
     try:
-        booking_id = await db.create_booking(user.id, slot_id)
+        booking_id = await db.create_booking(
+            user.id, 
+            slot_id, 
+            guests_count=guests_count,
+            reminder_hours_before=reminder_hours,
+            reminder_enabled=1 if reminder_hours is not None else 0
+        )
     except Exception as e:  # typically UNIQUE constraint
         logger.exception("Booking failed: %s", e)
         await callback.answer("Увы, этот слот только что заняли. Выберите другой.", show_alert=True)
@@ -180,9 +253,14 @@ async def on_book(callback: CallbackQuery):
         await callback.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
         return
     date_local, time_local = utc_iso_to_local_str(target.slot_utc, settings.timezone)
+    
+    reminder_text = "Без напоминания" if reminder_hours is None else f"за {reminder_hours} час(ов)"
+    table_info = f" ({target.note})" if target.note else ""
+    
     await callback.message.edit_text(
-        f"✅ Запись подтверждена на {hbold(date_local)} в {hbold(time_local)}.\n"
-        f"Мы пришлём напоминание за 2 часа до посещения."
+        f"✅ Запись подтверждена на {hbold(date_local)} в {hbold(time_local)}{table_info}.\n"
+        f"Количество гостей: {hbold(guests_count)}\n"
+        f"Напоминание: {reminder_text}"
     )  # type: ignore[union-attr]
     await callback.answer()
 
@@ -196,8 +274,10 @@ async def on_book(callback: CallbackQuery):
                     f"Новое бронирование\n"
                     f"Клиент: {hbold(user.full_name)} ({user.phone})\n"
                     f"Дата: {hbold(date_local)} {hbold(time_local)}\n"
+                    f"Гостей: {hbold(guests_count)}\n"
                     f"Слот ID: {target.id}\n"
-                    f"Примечание: {note}"
+                    f"Примечание: {note}\n"
+                    f"Напоминание: {reminder_text}"
                 ),
             )
         except Exception:
@@ -298,7 +378,9 @@ async def cmd_listbookings(message: Message):
     lines = []
     for b, u, s in rows:
         d, t = utc_iso_to_local_str(s.slot_utc, settings.timezone)
-        lines.append(f"{d} {t} — {u.full_name} ({u.phone}), booking #{b.id}, slot {s.id}")
+        reminder_text = f"напоминание за {b.reminder_hours_before}ч" if b.reminder_enabled and b.reminder_hours_before else "без напоминания"
+        table_info = f" ({s.note})" if s.note else ""
+        lines.append(f"{d} {t}{table_info} — {u.full_name} ({u.phone}), {b.guests_count} гостей, {reminder_text}, booking #{b.id}")
     await message.reply("Бронирования:\n" + "\n".join(lines))
 
 
@@ -318,6 +400,23 @@ async def cmd_delslot(message: Message):
         await message.reply("Слот не найден или уже удалён")
 
 
+@router.message(Command(commands=["addnote"]))
+async def cmd_addnote(message: Message):
+    if not _is_admin(message.from_user.id):  # type: ignore[arg-type]
+        return
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[1].isdigit():
+        await message.reply("Использование: /addnote SLOT_ID примечание")
+        return
+    slot_id = int(parts[1])
+    note = " ".join(parts[2:])
+    updated = await db.update_slot_note(slot_id, note)
+    if updated:
+        await message.reply(f"Примечание к слоту {slot_id} обновлено: {note}")
+    else:
+        await message.reply("Слот не найден")
+
+
 async def reminder_worker() -> None:
     await db.init()
     while True:
@@ -325,10 +424,10 @@ async def reminder_worker() -> None:
         try:
             candidates = await db.find_bookings_for_reminder(now_utc)
             if candidates:
-                for booking_id, chat_id, slot_id, slot_iso in candidates:
+                for booking_id, chat_id, slot_id, slot_iso, reminder_hours in candidates:
                     d, t = utc_iso_to_local_str(slot_iso, settings.timezone)
                     try:
-                        await bot.send_message(chat_id, f"Напоминание: вы записаны на {d} в {t} (через 2 часа)")
+                        await bot.send_message(chat_id, f"Напоминание: вы записаны на {d} в {t} (через {reminder_hours} час(ов))")
                         await db.mark_reminder_sent(booking_id)
                     except Exception as e:
                         logger.exception("Failed to send reminder: %s", e)
