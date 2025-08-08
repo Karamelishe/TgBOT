@@ -38,7 +38,7 @@ def load_settings() -> Settings:
 
     admin_ids = _get_admin_ids(os.getenv("ADMIN_IDS"))
     timezone = os.getenv("TZ", os.getenv("TIMEZONE", "Europe/Moscow"))
-    database_path = os.getenv("DATABASE_PATH", os.path.abspath("/workspace/booking_bot/bot.db"))
+    database_path = os.getenv("DATABASE_PATH", os.path.abspath("bot.db"))
 
     return Settings(
         bot_token=bot_token,

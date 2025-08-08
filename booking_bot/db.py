@@ -48,15 +48,18 @@ class Database:
 
     @asynccontextmanager
     async def connect(self) -> aiosqlite.Connection:
-        conn = await aiosqlite.connect(self.db_path)
-        await conn.execute("PRAGMA foreign_keys = ON;")
-        await conn.execute("PRAGMA journal_mode = WAL;")
-        await conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.row_factory = aiosqlite.Row
         try:
-            yield conn
-        finally:
-            await conn.close()
+            conn = await aiosqlite.connect(self.db_path)
+            await conn.execute("PRAGMA foreign_keys = ON;")
+            await conn.execute("PRAGMA journal_mode = WAL;")
+            await conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.row_factory = aiosqlite.Row
+            try:
+                yield conn
+            finally:
+                await conn.close()
+        except Exception as e:
+            raise RuntimeError(f"Failed to connect to database at {self.db_path}: {e}")
 
     async def init(self) -> None:
         async with self.connect() as conn:
