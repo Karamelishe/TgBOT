@@ -26,6 +26,8 @@ class Slot:
     duration_minutes: int
     note: Optional[str]
     created_by: Optional[int]
+    total_tables: int
+    available_tables: int
 
 
 @dataclass
@@ -81,6 +83,8 @@ class Database:
                     duration_minutes INTEGER NOT NULL DEFAULT 60,
                     note TEXT,
                     created_by INTEGER,
+                    total_tables INTEGER NOT NULL DEFAULT 1,
+                    available_tables INTEGER NOT NULL DEFAULT 1,
                     UNIQUE(slot_utc)
                 );
 
@@ -129,11 +133,11 @@ class Database:
                 return User(**dict(row))
 
     # Slots
-    async def add_slot(self, slot_utc_iso: str, duration_minutes: int = 60, note: Optional[str] = None, created_by: Optional[int] = None) -> int:
+    async def add_slot(self, slot_utc_iso: str, duration_minutes: int = 60, note: Optional[str] = None, created_by: Optional[int] = None, total_tables: int = 1) -> int:
         async with self.connect() as conn:
             await conn.execute(
-                "INSERT OR IGNORE INTO slots (slot_utc, duration_minutes, note, created_by) VALUES (?, ?, ?, ?)",
-                (slot_utc_iso, duration_minutes, note, created_by),
+                "INSERT OR IGNORE INTO slots (slot_utc, duration_minutes, note, created_by, total_tables, available_tables) VALUES (?, ?, ?, ?, ?, ?)",
+                (slot_utc_iso, duration_minutes, note, created_by, total_tables, total_tables),
             )
             await conn.commit()
             async with conn.execute("SELECT id FROM slots WHERE slot_utc = ?", (slot_utc_iso,)) as cur:
@@ -152,11 +156,29 @@ class Database:
             await conn.commit()
             return cur.rowcount > 0
 
+    async def update_slot_tables(self, slot_id: int, total_tables: int) -> bool:
+        async with self.connect() as conn:
+            # Получаем количество забронированных столиков
+            async with conn.execute(
+                "SELECT COUNT(*) FROM bookings WHERE slot_id = ?", (slot_id,)
+            ) as cur:
+                booked_tables = await cur.fetchone()
+                booked_count = booked_tables[0] if booked_tables else 0
+            
+            # Вычисляем доступные столики
+            available_tables = max(0, total_tables - booked_count)
+            
+            cur = await conn.execute(
+                "UPDATE slots SET total_tables = ?, available_tables = ? WHERE id = ?", 
+                (total_tables, available_tables, slot_id)
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def list_free_slots(self, since_utc_iso: Optional[str] = None, date_only: Optional[str] = None) -> List[Slot]:
         query = (
             "SELECT s.* FROM slots s "
-            "LEFT JOIN bookings b ON b.slot_id = s.id "
-            "WHERE b.id IS NULL"
+            "WHERE s.available_tables > 0"
         )
         params: List[str] = []
         if since_utc_iso:
@@ -192,10 +214,24 @@ class Database:
     # Bookings
     async def create_booking(self, user_id: int, slot_id: int, guests_count: int = 1, reminder_hours_before: Optional[int] = 2, reminder_enabled: int = 1) -> int:
         async with self.connect() as conn:
+            # Проверяем, есть ли доступные столики
+            async with conn.execute("SELECT available_tables FROM slots WHERE id = ?", (slot_id,)) as cur:
+                row = await cur.fetchone()
+                if not row or row[0] <= 0:
+                    raise RuntimeError("Нет доступных столиков для этого времени")
+            
+            # Создаем бронирование
             await conn.execute(
                 "INSERT INTO bookings (user_id, slot_id, guests_count, reminder_hours_before, reminder_enabled) VALUES (?, ?, ?, ?, ?)",
                 (user_id, slot_id, guests_count, reminder_hours_before, reminder_enabled),
             )
+            
+            # Уменьшаем количество доступных столиков
+            await conn.execute(
+                "UPDATE slots SET available_tables = available_tables - 1 WHERE id = ?",
+                (slot_id,)
+            )
+            
             await conn.commit()
             async with conn.execute("SELECT id FROM bookings WHERE user_id = ? AND slot_id = ?", (user_id, slot_id)) as cur:
                 row = await cur.fetchone()
@@ -223,7 +259,7 @@ class Database:
         query = (
             "SELECT b.id AS b_id, b.user_id AS b_user_id, b.slot_id AS b_slot_id, b.created_at AS b_created_at, b.reminder_sent AS b_reminder_sent, b.status AS b_status, b.guests_count AS b_guests_count, b.reminder_hours_before AS b_reminder_hours_before, b.reminder_enabled AS b_reminder_enabled, "
             "u.id AS u_id, u.tg_user_id AS u_tg_user_id, u.chat_id AS u_chat_id, u.full_name AS u_full_name, u.phone AS u_phone, u.is_admin AS u_is_admin, u.created_at AS u_created_at, "
-            "s.id AS s_id, s.slot_utc AS s_slot_utc, s.duration_minutes AS s_duration_minutes, s.note AS s_note, s.created_by AS s_created_by "
+            "s.id AS s_id, s.slot_utc AS s_slot_utc, s.duration_minutes AS s_duration_minutes, s.note AS s_note, s.created_by AS s_created_by, s.total_tables AS s_total_tables, s.available_tables AS s_available_tables "
             "FROM bookings b JOIN users u ON u.id = b.user_id JOIN slots s ON s.id = b.slot_id"
         )
         params: List[str] = []
@@ -264,6 +300,8 @@ class Database:
                         duration_minutes=r["s_duration_minutes"],
                         note=r["s_note"],
                         created_by=r["s_created_by"],
+                        total_tables=r["s_total_tables"],
+                        available_tables=r["s_available_tables"],
                     )
                     result.append((booking, user, slot))
                 return result

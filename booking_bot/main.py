@@ -56,15 +56,15 @@ async def list_dates_keyboard() -> Tuple[str, Optional[List[str]]]:
     return ("Выберите дату:", dates_local)
 
 
-async def list_times_keyboard(date_local: str) -> Tuple[str, Optional[List[Tuple[int, str, Optional[str]]]]]:
+async def list_times_keyboard(date_local: str) -> Tuple[str, Optional[List[Tuple[int, str, Optional[str], int]]]]:
     # Need to find free slots for that local date
     # To avoid DST issues, convert all free slots to local and filter by date string
     free = await db.list_free_slots(since_utc_iso=None)
-    pairs: List[Tuple[int, str, Optional[str]]] = []
+    pairs: List[Tuple[int, str, Optional[str], int]] = []
     for s in free:
         d_str, t_str = utc_iso_to_local_str(s.slot_utc, settings.timezone)
         if d_str == date_local:
-            pairs.append((s.id, t_str, s.note))
+            pairs.append((s.id, t_str, s.note, s.available_tables))
     pairs.sort(key=lambda x: x[1])
     if not pairs:
         return (f"На дату {date_local} свободных слотов нет.", None)
@@ -266,6 +266,7 @@ async def on_confirm_booking(callback: CallbackQuery):
 
     # notify admins
     note = target.note or ""
+    tables_info = f"{target.available_tables}/{target.total_tables} столиков"
     for admin_id in settings.admin_ids:
         try:
             await bot.send_message(
@@ -277,7 +278,8 @@ async def on_confirm_booking(callback: CallbackQuery):
                     f"Гостей: {hbold(guests_count)}\n"
                     f"Слот ID: {target.id}\n"
                     f"Примечание: {note}\n"
-                    f"Напоминание: {reminder_text}"
+                    f"Напоминание: {reminder_text}\n"
+                    f"Осталось столиков: {hbold(tables_info)}"
                 ),
             )
         except Exception:
@@ -296,16 +298,30 @@ async def cmd_addslot(message: Message):
         return
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("Использование: /addslot YYYY-MM-DD HH:MM [длительность_мин] [примечание]")
+        await message.reply("Использование: /addslot YYYY-MM-DD HH:MM [длительность_мин] [количество_столиков] [примечание]")
         return
     date_str, time_str = parts[1], parts[2]
-    duration = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 60
-    note = " ".join(parts[4:]) if len(parts) >= 5 else None
+    duration = 60
+    total_tables = 1
+    note = None
+    
+    # Парсим параметры
+    for part in parts[3:]:
+        if part.isdigit():
+            if duration == 60:  # Первое число - длительность
+                duration = int(part)
+            else:  # Второе число - количество столиков
+                total_tables = int(part)
+        else:
+            # Не число - примечание
+            note = " ".join(parts[parts.index(part):])
+            break
+    
     local_dt = f"{date_str} {time_str}"
     utc_iso = local_to_utc_iso(local_dt, settings.timezone)
-    slot_id = await db.add_slot(utc_iso, duration_minutes=duration, note=note, created_by=message.from_user.id)  # type: ignore[arg-type]
+    slot_id = await db.add_slot(utc_iso, duration_minutes=duration, note=note, created_by=message.from_user.id, total_tables=total_tables)  # type: ignore[arg-type]
     d_loc, t_loc = utc_iso_to_local_str(utc_iso, settings.timezone)
-    await message.reply(f"Слот добавлен: {d_loc} {t_loc} (ID {slot_id})")
+    await message.reply(f"Слот добавлен: {d_loc} {t_loc} (ID {slot_id}, {total_tables} столиков)")
 
 
 @router.message(Command(commands=["addslots"]))
@@ -359,7 +375,15 @@ async def cmd_listfree(message: Message):
     if not free_pairs:
         await message.reply("Свободных слотов нет")
         return
-    lines = [f"ID {sid}: {d} {t}" for sid, d, t in free_pairs]
+    lines = []
+    for sid, d, t in free_pairs:
+        # Получаем информацию о слоте
+        slots = await db.list_slots()
+        slot = next((s for s in slots if s.id == sid), None)
+        if slot:
+            lines.append(f"ID {sid}: {d} {t} ({slot.available_tables}/{slot.total_tables} столиков)")
+        else:
+            lines.append(f"ID {sid}: {d} {t}")
     await message.reply("Свободные слоты:\n" + "\n".join(lines))
 
 
@@ -380,7 +404,8 @@ async def cmd_listbookings(message: Message):
         d, t = utc_iso_to_local_str(s.slot_utc, settings.timezone)
         reminder_text = f"напоминание за {b.reminder_hours_before}ч" if b.reminder_enabled and b.reminder_hours_before else "без напоминания"
         table_info = f" ({s.note})" if s.note else ""
-        lines.append(f"{d} {t}{table_info} — {u.full_name} ({u.phone}), {b.guests_count} гостей, {reminder_text}, booking #{b.id}")
+        tables_info = f" [{s.available_tables}/{s.total_tables} столиков]"
+        lines.append(f"{d} {t}{table_info}{tables_info} — {u.full_name} ({u.phone}), {b.guests_count} гостей, {reminder_text}, booking #{b.id}")
     await message.reply("Бронирования:\n" + "\n".join(lines))
 
 
@@ -413,6 +438,23 @@ async def cmd_addnote(message: Message):
     updated = await db.update_slot_note(slot_id, note)
     if updated:
         await message.reply(f"Примечание к слоту {slot_id} обновлено: {note}")
+    else:
+        await message.reply("Слот не найден")
+
+
+@router.message(Command(commands=["settables"]))
+async def cmd_settables(message: Message):
+    if not _is_admin(message.from_user.id):  # type: ignore[arg-type]
+        return
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.reply("Использование: /settables SLOT_ID количество_столиков")
+        return
+    slot_id = int(parts[1])
+    total_tables = int(parts[2])
+    updated = await db.update_slot_tables(slot_id, total_tables)
+    if updated:
+        await message.reply(f"Количество столиков для слота {slot_id} обновлено: {total_tables}")
     else:
         await message.reply("Слот не найден")
 

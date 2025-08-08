@@ -26,13 +26,14 @@ def dates_kb(dates_iso: List[str]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def times_kb(pairs: List[Tuple[int, str, Optional[str]]]) -> InlineKeyboardMarkup:
+def times_kb(pairs: List[Tuple[int, str, Optional[str], int]]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for slot_id, label, note in pairs:
-        # Add note to button text if available
+    for slot_id, label, note, available_tables in pairs:
+        # Add note and available tables to button text
         button_text = label
         if note:
             button_text += f" ({note})"
+        button_text += f" [{available_tables} столик(ов)]"
         builder.button(text=button_text, callback_data=f"select_time:{slot_id}")
     builder.adjust(2)
     builder.button(text="Назад", callback_data="back_to_dates")
