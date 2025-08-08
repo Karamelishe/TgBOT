@@ -10,6 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.markdown import hbold
+from aiogram.client.default import DefaultBotProperties
 
 from config import load_settings
 from db import Database, Slot
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 settings = load_settings()
 
-bot = Bot(token=settings.bot_token, parse_mode=ParseMode.HTML)
+bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
