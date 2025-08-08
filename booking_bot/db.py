@@ -5,7 +5,10 @@ import aiosqlite
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta, timezone
+ main
+=======
 from contextlib import asynccontextmanager
+ cursor/telegram-booking-and-reminder-bot-4375
 
 
 @dataclass
@@ -43,17 +46,24 @@ class Database:
         self.db_path = db_path
         self._lock = asyncio.Lock()
 
+ main
+
     @asynccontextmanager
+ cursor/telegram-booking-and-reminder-bot-4375
     async def connect(self) -> aiosqlite.Connection:
         conn = await aiosqlite.connect(self.db_path)
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
         conn.row_factory = aiosqlite.Row
+ main
+        return conn
+
         try:
             yield conn
         finally:
             await conn.close()
+ cursor/telegram-booking-and-reminder-bot-4375
 
     async def init(self) -> None:
         async with self.connect() as conn:
