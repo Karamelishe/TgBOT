@@ -10,6 +10,10 @@ from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.markdown import hbold
+ main
+=======
+from aiogram.client.default import DefaultBotProperties
+ cursor/telegram-booking-and-reminder-bot-4375
 
 from config import load_settings
 from db import Database, Slot
@@ -23,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 settings = load_settings()
 
+ main
 bot = Bot(token=settings.bot_token, parse_mode=ParseMode.HTML)
+=======
+bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+ cursor/telegram-booking-and-reminder-bot-4375
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
